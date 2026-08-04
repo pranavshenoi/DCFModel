@@ -77,6 +77,38 @@ def calculate_historical_fcf(data: dict) -> pd.Series:
     return fcf.sort_index()
 
 
+def base_fcf_from_history(hist_fcf: pd.Series, years: int = 3) -> dict:
+    """
+    Pick a base FCF to project forward from. Uses the average of the most
+    recent `years` (or however many are available, if fewer) instead of
+    just the single most recent year — a lone unusual year (a working
+    capital swing, a one-off charge, a heavy CapEx year) can otherwise
+    dominate the entire valuation even when it's not representative of
+    the company's normal cash generation.
+
+    Returns both the smoothed average and the raw most-recent-year value
+    so the caller can flag it if they diverge significantly — that
+    divergence itself is useful information, not just an implementation
+    detail to hide.
+    """
+    recent = hist_fcf.tail(min(years, len(hist_fcf)))
+    average_fcf = recent.mean()
+    most_recent_fcf = hist_fcf.iloc[-1]
+
+    # Flag when the most recent single year is materially different from
+    # the smoothed average — a signal the base may be noisy either way.
+    diverges = False
+    if average_fcf != 0:
+        diverges = abs(most_recent_fcf - average_fcf) / abs(average_fcf) > 0.30
+
+    return {
+        "base_fcf": average_fcf,
+        "most_recent_fcf": most_recent_fcf,
+        "years_used": len(recent),
+        "diverges_from_recent": diverges,
+    }
+
+
 def calculate_tax_rate(data: dict) -> float:
     """Effective tax rate = Tax Provision / Pre-tax Income, most recent year."""
     inc = data["income_stmt"]
@@ -273,7 +305,8 @@ def run_all_scenarios(data: dict, wacc_result: dict, base_growth: float) -> dict
     bs = data["balance_sheet"]
 
     hist_fcf = calculate_historical_fcf(data)
-    base_fcf = hist_fcf.iloc[-1]
+    fcf_base_info = base_fcf_from_history(hist_fcf, years=3)
+    base_fcf = fcf_base_info["base_fcf"]
 
     debt_row = next((r for r in bs.index if "Total Debt" in r), None)
     cash_row = next((r for r in bs.index if r == "Cash And Cash Equivalents"), None)
@@ -283,6 +316,48 @@ def run_all_scenarios(data: dict, wacc_result: dict, base_growth: float) -> dict
 
     shares_outstanding = safe_num(info.get("sharesOutstanding"), default=0.0)
     terminal_growth = 0.025  # long-run GDP-ish growth assumption
+
+    # --- Reliability warnings ---------------------------------------
+    # These don't change the numbers — they flag when the DCF's core
+    # assumptions (positive, organically growing FCF; debt that reflects
+    # real operating leverage) don't hold for this company, so the
+    # output shouldn't be read at face value.
+    warnings = []
+
+    if base_fcf <= 0:
+        warnings.append(
+            f"Average free cash flow over the last {fcf_base_info['years_used']} "
+            f"year(s) is negative (${base_fcf:,.0f}). A standard growth DCF "
+            "assumes a positive, growing cash flow base — projecting growth "
+            "on a negative number makes it progressively MORE negative, not "
+            "less. This usually means the company is in a heavy investment "
+            "or cash-burn phase (e.g. capital expenditure cycle) and needs "
+            "a different valuation approach (e.g. projecting the year FCF "
+            "turns positive, then discounting from there)."
+        )
+    elif fcf_base_info["diverges_from_recent"]:
+        warnings.append(
+            f"The most recent year's FCF (${fcf_base_info['most_recent_fcf']:,.0f}) "
+            f"differs from the {fcf_base_info['years_used']}-year average used as "
+            f"the model's base (${base_fcf:,.0f}) by more than 30%. This model "
+            "uses the multi-year average to avoid over-weighting a single "
+            "unusual year, but it's worth checking why the two diverge — e.g. "
+            "a one-off charge, working capital swing, or genuine trend change "
+            "— since either number could be the more representative one "
+            "depending on the cause."
+        )
+
+    market_cap = safe_num(wacc_result.get("market_cap"), default=0.0)
+    if market_cap > 0 and net_debt > market_cap:
+        warnings.append(
+            "Net debt exceeds market capitalization. For companies with a "
+            "large captive finance arm (e.g. auto, equipment, or consumer "
+            "lending divisions), 'Total Debt' on the balance sheet often "
+            "includes financing debt matched by loan receivables on the "
+            "asset side — subtracting all of it as if it were operating "
+            "leverage overstates net debt and understates equity value. "
+            "Consider a sum-of-the-parts valuation instead."
+        )
 
     scenarios = {
         "Bull Case": base_growth + 0.05,
@@ -305,10 +380,13 @@ def run_all_scenarios(data: dict, wacc_result: dict, base_growth: float) -> dict
     return {
         "scenarios": results,
         "base_fcf": base_fcf,
+        "most_recent_fcf": fcf_base_info["most_recent_fcf"],
+        "fcf_years_averaged": fcf_base_info["years_used"],
         "net_debt": net_debt,
         "shares_outstanding": shares_outstanding,
         "terminal_growth": terminal_growth,
         "current_price": safe_num(info.get("currentPrice"), default=0.0),
+        "warnings": warnings,
     }
 
 
@@ -351,9 +429,35 @@ def implied_growth_rate(
     shares_outstanding: float,
     wacc: float,
     terminal_growth: float,
-) -> float:
-    """Binary-search the FCF growth rate that makes intrinsic value = market price."""
+):
+    """Binary-search the FCF growth rate that makes intrinsic value = market
+    price. Returns None if no growth rate in the searched range (-10% to
+    +40%) gets there — this means the market is pricing in something the
+    model can't express (e.g. >40% sustained growth), NOT that 40% is the
+    answer. Silently returning the boundary would be misleading."""
     low, high = -0.10, 0.40
+
+    if base_fcf <= 0:
+        # With negative starting FCF, growing it makes it MORE negative,
+        # not less — the usual "higher growth = higher value" relationship
+        # inverts. Implied growth isn't a meaningful concept here at all.
+        return None
+
+    # Check whether a solution actually exists inside [low, high] before
+    # searching — otherwise binary search just converges to whichever
+    # boundary is closest, which looks like a real answer but isn't.
+    value_at_low = run_dcf_scenario(
+        base_fcf, low, wacc, terminal_growth, net_debt, shares_outstanding
+    )["intrinsic_value_per_share"]
+    value_at_high = run_dcf_scenario(
+        base_fcf, high, wacc, terminal_growth, net_debt, shares_outstanding
+    )["intrinsic_value_per_share"]
+
+    if market_price > value_at_high:
+        return None  # market price implies growth beyond the search range
+    if market_price < value_at_low:
+        return None  # market price implies growth below the search range
+
     for _ in range(60):
         mid = (low + high) / 2
         result = run_dcf_scenario(
@@ -431,11 +535,40 @@ def export_to_excel(data: dict, wacc_result: dict, scenario_data: dict,
 
     row += 1
     ws[f"A{row}"] = "Implied FCF Growth (Market)"
-    ws[f"B{row}"] = implied_growth
-    ws[f"B{row}"].number_format = "0.00%"
+    if implied_growth is None:
+        ws[f"B{row}"] = "n/a — outside sane range, see warnings"
+        ws[f"B{row}"].font = Font(italic=True, color="B00000")
+    else:
+        ws[f"B{row}"] = implied_growth
+        ws[f"B{row}"].number_format = "0.00%"
     ws[f"A{row}"].font = Font(bold=True)
 
     row += 2
+    ws[f"A{row}"] = f"Base FCF ({scenario_data['fcf_years_averaged']}-yr avg, used in model)"
+    ws[f"B{row}"] = scenario_data["base_fcf"]
+    ws[f"B{row}"].number_format = '"$"#,##0,,"M"'
+    row += 1
+    ws[f"A{row}"] = "Most Recent Single-Year FCF (for reference)"
+    ws[f"B{row}"] = scenario_data["most_recent_fcf"]
+    ws[f"B{row}"].number_format = '"$"#,##0,,"M"'
+    ws[f"A{row}"].font = Font(italic=True, color="777777")
+    ws[f"B{row}"].font = Font(italic=True, color="777777")
+
+    row += 2
+    warnings = scenario_data.get("warnings", [])
+    if warnings:
+        ws[f"A{row}"] = "⚠ Reliability Warnings"
+        ws[f"A{row}"].font = Font(bold=True, color="B00000", size=12)
+        row += 1
+        for w in warnings:
+            ws[f"A{row}"] = w
+            ws[f"A{row}"].font = Font(size=9, color="B00000", italic=True)
+            ws[f"A{row}"].alignment = Alignment(wrap_text=True, vertical="top")
+            ws.merge_cells(f"A{row}:C{row}")
+            ws.row_dimensions[row].height = 60
+            row += 1
+        row += 1
+
     ws[f"A{row}"] = "WACC Breakdown"
     ws[f"A{row}"].font = Font(bold=True, color=GOLD, size=12)
     row += 1
@@ -593,11 +726,13 @@ def run_valuation(
         base_growth = manual_growth
     else:
         hist_fcf = calculate_historical_fcf(data)
-        if len(hist_fcf) >= 2 and hist_fcf.iloc[0] > 0:
+        if len(hist_fcf) >= 2 and hist_fcf.iloc[0] > 0 and hist_fcf.iloc[-1] > 0:
             years_span = len(hist_fcf) - 1
             cagr = (hist_fcf.iloc[-1] / hist_fcf.iloc[0]) ** (1 / years_span) - 1
             base_growth = min(max(cagr, 0.0), 0.25)  # clamp to a sane range
         else:
+            # Negative start or end value makes CAGR undefined/complex —
+            # fall back to a conservative flat assumption instead.
             base_growth = 0.08  # fallback assumption
 
     scenario_data = run_all_scenarios(data, wacc_result, base_growth)
@@ -626,7 +761,22 @@ def run_valuation(
         print(f"  {name:<12} growth={result['growth_rate']:.1%}  "
               f"value=${result['intrinsic_value_per_share']:.2f}")
     print(f"\n  Current market price: ${scenario_data['current_price']:.2f}")
-    print(f"  Implied market growth: {implied_g:.1%}")
+    if implied_g is None:
+        print("  Implied market growth: n/a — market price implies growth "
+              "outside a sane range (or base FCF is negative); see warnings below")
+    else:
+        print(f"  Implied market growth: {implied_g:.1%}")
+    print(f"\n  Base FCF used ({scenario_data['fcf_years_averaged']}-yr avg): "
+          f"${scenario_data['base_fcf']:,.0f}")
+    print(f"  Most recent single-year FCF: ${scenario_data['most_recent_fcf']:,.0f}")
+
+    if scenario_data["warnings"]:
+        print("\n" + "!" * 60)
+        print("  WARNINGS — read before trusting these numbers")
+        print("!" * 60)
+        for w in scenario_data["warnings"]:
+            print(f"  - {w}\n")
+
     print("\n" + "=" * 60)
     print("  VALUATION COMPLETE")
     print(f"  Output saved to: {filepath}")
